@@ -117,6 +117,87 @@ end
     return search
 end
 
+# === Variable search radius neighborhood search ===
+# A wrapper around multiple neighborhood searches that share the same points 
+# but operate using different search radii. 
+struct VariableSearchRadiusNHS{SR, NHS} <: AbstractNeighborhoodSearch
+    search_radii          :: SR
+    neighborhood_searches :: NHS
+end
+
+function VariableSearchRadiusNHS(nhs_implementation, search_radii, n_particles)
+    searches = Tuple(copy_neighborhood_search(nhs_implementation,
+                                                             search_radius, n_particles)
+                     for search_radius in search_radii)
+    return VariableSearchRadiusNHS(search_radii, searches)
+end
+
+@inline Base.ndims(search::VariableSearchRadiusNHS) = ndims(first(search.neighborhood_searches))
+
+@inline requires_update(::VariableSearchRadiusNHS) = (false, true)
+
+@inline function initialize!(search::VariableSearchRadiusNHS, x, y;
+                             parallelization_backend=default_backend(x),
+                             eachindex_y=axes(y, 2))
+    (; neighborhood_searches) = search
+
+    for nhs in neighborhood_searches
+        initialize!(nhs, x, y; parallelization_backend, eachindex_y)
+    end
+
+    return search
+end
+
+@inline function update!(search::VariableSearchRadiusNHS, x, y;
+                         points_moving=(true, true),
+                         parallelization_backend=default_backend(x),
+                         eachindex_y=axes(y, 2))
+    (; neighborhood_searches) = search
+
+    for nhs in neighborhood_searches
+        update!(nhs, x, y; points_moving=points_moving, parallelization_backend=parallelization_backend, eachindex_y)
+    end
+
+    return search
+end
+
+function copy_neighborhood_search(nhs::VariableSearchRadiusNHS,
+                                  search_radii, n_points; eachpoint = 1:n_points)
+    searches = Tuple(copy_neighborhood_search(nhs, search_radius, n_points; eachpoint=eachpoint)
+                     for search_radius in search_radii)
+
+    return VariableSearchRadiusNHS(search_radii, searches)
+end
+
+# Iterate over neighbors by dynamically selecting the correct underlying neighborhood 
+# search based on the requested search radius.
+@inline function foreach_neighbor(f, neighbor_system_coords,
+                                  neighborhood_search::VariableSearchRadiusNHS,
+                                  point, point_coords, search_radius)
+    # Find the index of the search radius in the list of search radii for this system
+    search_radii = neighborhood_search.search_radii
+    idx = searchsortedfirst(SVector(search_radii), search_radius - eps(search_radius))
+
+    nhs = neighborhood_search.neighborhood_searches[idx]
+
+    foreach_neighbor(f, neighbor_system_coords, nhs, point, point_coords,
+                                    search_radius)
+end
+
+@inline function foreach_neighbor(f, neighbor_system_coords,
+                                  neighborhood_search::VariableSearchRadiusNHS,
+                                  point, point_coords, search_radius)
+    # Find the index of the search radius in the list of search radii for this system
+    search_radii = neighborhood_search.search_radii
+    idx = searchsortedfirst(SVector(search_radii), search_radius - eps(search_radius))
+
+    nhs = neighborhood_search.neighborhood_searches[idx]
+
+    foreach_neighbor(f, neighbor_system_coords, nhs, point, point_coords,
+                                    search_radius)
+end
+
+
 """
     PeriodicBox(; min_corner, max_corner)
 
@@ -182,7 +263,8 @@ See also [`initialize!`](@ref), [`update!`](@ref).
 """
 function foreach_point_neighbor(f::T, system_coords, neighbor_coords, neighborhood_search;
                                 parallelization_backend::ParallelizationBackend = default_backend(system_coords),
-                                points = axes(system_coords, 2)) where {T}
+                                points = axes(system_coords, 2),
+                                search_radius = nothing) where {T}
     # The type annotation above is to make Julia specialize on the type of the function.
     # Otherwise, unspecialized code will cause a lot of allocations
     # and heavily impact performance.
@@ -194,7 +276,7 @@ function foreach_point_neighbor(f::T, system_coords, neighbor_coords, neighborho
     @threaded parallelization_backend for point in points
         # Now we can safely assume that `point` is inbounds
         @inbounds foreach_neighbor(f, system_coords, neighbor_coords,
-                                   neighborhood_search, point)
+                                   neighborhood_search, point, search_radius)
     end
 
     return nothing
@@ -202,18 +284,51 @@ end
 
 @propagate_inbounds function foreach_neighbor(f, system_coords, neighbor_system_coords,
                                               neighborhood_search::AbstractNeighborhoodSearch,
-                                              point;
-                                              search_radius = search_radius(neighborhood_search))
+                                              point, ::Nothing)
     # Due to https://github.com/JuliaLang/julia/issues/30411, we cannot just remove
     # a `@boundscheck` by calling this function with `@inbounds` because it has a kwarg.
     # We have to use `@propagate_inbounds`, which will also remove boundschecks
     # in the neighbor loop, which is not safe (see comment below).
     # To avoid this, we have to use a function barrier to disable the `@inbounds` again.
     point_coords = extract_svector(system_coords, Val(ndims(neighborhood_search)), point)
+    radius = search_radius(neighborhood_search)
+
+    foreach_neighbor(f, neighbor_system_coords, neighborhood_search,
+                     point, point_coords, radius)
+end
+
+@propagate_inbounds function foreach_neighbor(f, system_coords, neighbor_system_coords,
+                                              neighborhood_search::VariableSearchRadiusNHS,
+                                              point, search_radius)
+    # Due to https://github.com/JuliaLang/julia/issues/30411, we cannot just remove
+    # a `@boundscheck` by calling this function with `@inbounds` because it has a kwarg.
+    # We have to use `@propagate_inbounds`, which will also remove boundschecks
+    # in the neighbor loop, which is not safe (see comment below).
+    # To avoid this, we have to use a function barrier to disable the `@inbounds` again.    
+    point_coords = extract_svector(system_coords, Val(ndims(neighborhood_search)), point)
 
     foreach_neighbor(f, neighbor_system_coords, neighborhood_search,
                      point, point_coords, search_radius)
 end
+
+# TODO
+# Dummy function for letting the test runs, since passing a search radius for VariableSearchRadiusNHS
+# is not implemented yet. As soon as this gets implmented, DELETE THIS! 
+@propagate_inbounds function foreach_neighbor(f, system_coords, neighbor_system_coords,
+                                              neighborhood_search::VariableSearchRadiusNHS,
+                                              point, ::Nothing)
+    # Due to https://github.com/JuliaLang/julia/issues/30411, we cannot just remove
+    # a `@boundscheck` by calling this function with `@inbounds` because it has a kwarg.
+    # We have to use `@propagate_inbounds`, which will also remove boundschecks
+    # in the neighbor loop, which is not safe (see comment below).
+    # To avoid this, we have to use a function barrier to disable the `@inbounds` again.    
+    point_coords = extract_svector(system_coords, Val(ndims(neighborhood_search)), point)
+    search_radius = minimum(neighborhood_search.search_radii)
+
+    foreach_neighbor(f, neighbor_system_coords, neighborhood_search,
+                     point, point_coords, search_radius)
+end
+
 
 # This is the generic function that is called for `TrivialNeighborhoodSearch`.
 # For `GridNeighborhoodSearch`, a specialized function is used for slightly better

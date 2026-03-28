@@ -21,7 +21,7 @@ include("nhs_precomputed.jl")
 include("gpu.jl")
 
 export foreach_point_neighbor, foreach_neighbor
-export TrivialNeighborhoodSearch, GridNeighborhoodSearch, PrecomputedNeighborhoodSearch
+export TrivialNeighborhoodSearch, GridNeighborhoodSearch, PrecomputedNeighborhoodSearch, VariableSearchRadiusNHS
 export DictionaryCellList, FullGridCellList, SpatialHashingCellList
 export DynamicVectorOfVectors
 export ParallelUpdate, SemiParallelUpdate, SerialIncrementalUpdate, SerialUpdate,
